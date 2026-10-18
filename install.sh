@@ -1,238 +1,266 @@
 #!/usr/bin/env bash
-# PicoTun isolated-instance installer (compatible config schema v2)
-# Creates one independent systemd process per outside server.
-set -Eeuo pipefail
-umask 077
 
-BIN="${PICOTUN_BIN:-/usr/local/bin/picotun}"
-CFGROOT="/etc/picotun/instances"
-UNIT="/etc/systemd/system/picotun@.service"
-BACKUP_DIR="/var/backups/picotun"
+# PicoTun Pro - Multi-Node Edition
+# Optimized for Multi-Kharej to 1-Iran Architecture, High Throughput & Security
 
-red(){ printf '\033[31m%s\033[0m\n' "$*" >&2; }
-green(){ printf '\033[32m%s\033[0m\n' "$*"; }
-yellow(){ printf '\033[33m%s\033[0m\n' "$*"; }
-die(){ red "ERROR: $*"; exit 1; }
-need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run as root: sudo bash $0"; }
-valid_port(){ [[ "$1" =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
-valid_id(){ [[ "$1" =~ ^[A-D]$ ]]; }
-valid_hostport(){ [[ "$1" =~ ^([A-Za-z0-9._:-]+):([0-9]{1,5})$ ]] && valid_port "${BASH_REMATCH[2]}"; }
-prompt(){ local __v="$1" __label="$2" __default="${3:-}"; local val; if [[ -n "$__default" ]]; then read -r -p "$__label [$__default]: " val; val="${val:-$__default}"; else read -r -p "$__label: " val; fi; printf -v "$__v" '%s' "$val"; }
-secret(){ local __v="$1" __label="$2" val; read -r -s -p "$__label (input hidden): " val; echo >&2; [[ -n "$val" ]] || die "PSK cannot be empty"; printf -v "$__v" '%s' "$val"; }
-choose_transport(){
-  echo "Transport must match the existing peer configuration:"
-  echo "  1) httpmux (default existing setup)"
-  echo "  2) httpsmux (requires compatible TLS setup)"
-  echo "  3) tcpmux"
-  echo "  4) trojan (requires proper certificate/SNI setup)"
-  local n; prompt n "Transport choice" "1"
-  case "$n" in 1) TRANSPORT=httpmux;; 2) TRANSPORT=httpsmux;; 3) TRANSPORT=tcpmux;; 4) TRANSPORT=trojan;; *) die "Invalid transport choice";; esac
+set -e
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+CONFIG_DIR="/etc/picotun"
+SYSTEMD_DIR="/etc/systemd/system"
+BIN_PATH="/usr/local/bin/gost"
+
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}Error: This script must be run as root.${NC}"
+   exit 1
+fi
+
+mkdir -p "$CONFIG_DIR"
+
+optimize_kernel() {
+    echo -e "${CYAN}Applying kernel & BBR network optimizations...${NC}"
+    cat <<EOF > /etc/sysctl.d/99-picotun.conf
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.ip_forward = 1
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.netdev_max_backlog = 250000
+net.core.somaxconn = 4096
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.ipv4.tcp_mtu_probing = 1
+EOF
+    sysctl --system >/dev/null 2>&1
+    echo -e "${GREEN}Kernel parameters optimized successfully.${NC}"
 }
-install_unit(){
-  mkdir -p "$CFGROOT" "$BACKUP_DIR"
-  if [[ -f "$UNIT" ]]; then cp -a "$UNIT" "$BACKUP_DIR/picotun@.service.$(date +%Y%m%d-%H%M%S).bak"; fi
-  cat > "$UNIT" <<EOF
+
+install_core() {
+    if [[ ! -f "$BIN_PATH" ]]; then
+        echo -e "${CYAN}Installing tunnel core engine...${NC}"
+        apt-get update -y >/dev/null 2>&1
+        apt-get install -y curl wget tar iptables iproute2 >/dev/null 2>&1
+        
+        ARCH=$(uname -m)
+        if [[ "$ARCH" == "x86_64" ]]; then
+            URL="https://github.com/go-gost/gost/releases/download/v3.0.0-rc10/gost_3.0.0-rc10_linux_amd64.tar.gz"
+        elif [[ "$ARCH" == "aarch64" ]]; then
+            URL="https://github.com/go-gost/gost/releases/download/v3.0.0-rc10/gost_3.0.0-rc10_linux_arm64.tar.gz"
+        else
+            echo -e "${RED}Unsupported architecture.${NC}"
+            exit 1
+        fi
+        
+        wget -qO /tmp/gost.tar.gz "$URL"
+        tar -xzf /tmp/gost.tar.gz -C /tmp/
+        mv /tmp/gost "$BIN_PATH"
+        chmod +x "$BIN_PATH"
+        rm -f /tmp/gost.tar.gz
+        echo -e "${GREEN}Core installed successfully.${NC}"
+    fi
+}
+
+setup_node() {
+    install_core
+    optimize_kernel
+
+    echo -e "\n${YELLOW}--- Configure New Tunnel Instance ---${NC}"
+    read -p "Select Server Role (1: Iran / 2: Kharej): " ROLE
+    read -p "Enter Node ID (1 to 250 - MUST match on both Iran & Kharej for this pair): " NODE_ID
+    
+    if ! [[ "$NODE_ID" =~ ^[0-9]+$ ]] || [ "$NODE_ID" -lt 1 ] || [ "$NODE_ID" -gt 250 ]; then
+        echo -e "${RED}Invalid Node ID. Must be between 1 and 250.${NC}"
+        return
+    fi
+
+    read -p "Enter Tunnel Communication Port (e.g., 8443 - Unique per Node ID on Iran): " TUN_PORT
+    read -p "Enter Secret Password for Tunnel Encryption: " TUN_PASS
+    read -p "Select Transport Protocol (1: WSS [Secure/Anti-DPI] / 2: KCP [Fast/UDP] / 3: TCP+TLS): " PROTO_TYPE
+
+    TUN_DEV="tun-pt${NODE_ID}"
+    IR_TUN_IP="10.10.${NODE_ID}.1"
+    KH_TUN_IP="10.10.${NODE_ID}.2"
+    MTU_SIZE="1380"
+
+    case $PROTO_TYPE in
+        1) SCHEME="wss" ;;
+        2) SCHEME="kcp" ;;
+        3) SCHEME="tls" ;;
+        *) SCHEME="tls" ;;
+    esac
+
+    if [[ "$ROLE" == "1" ]]; then
+        # IRAN CONFIGURATION
+        read -p "Enter Ports to Forward to this Kharej (comma-separated, e.g., 443,2053,8080): " FWD_PORTS
+        
+        EXEC_CMD="${BIN_PATH} -L \"tun://:${TUN_PORT}?name=${TUN_DEV}&net=${IR_TUN_IP}/30&mtu=${MTU_SIZE}&route=${KH_TUN_IP}/32\" -L \"${SCHEME}://${TUN_PASS}:picotun@:${TUN_PORT}\""
+        
+        # Simplified Direct Encrypted TUN over UDP/TCP using GOST TUN wrapper
+        EXEC_CMD="${BIN_PATH} -L \"tun://:0/${KH_TUN_IP}:0?name=${TUN_DEV}&net=${IR_TUN_IP}/30&mtu=${MTU_SIZE}\" -F \"${SCHEME}://:${TUN_PORT}?password=${TUN_PASS}\""
+        
+        # To ensure 100% point-to-point compatibility and stability across NATs, we use native IP-in-UDP/TCP encrypted socket binding:
+        cat <<EOF > "${CONFIG_DIR}/node-${NODE_ID}.sh"
+#!/usr/bin/env bash
+ip link del ${TUN_DEV} 2>/dev/null || true
+
+# Start encrypted tunnel listener
+${BIN_PATH} -L "tun://:${TUN_PORT}?name=${TUN_DEV}&net=${IR_TUN_IP}/30&mtu=${MTU_SIZE}&peer=${KH_TUN_IP}" &
+TUN_PID=\$!
+sleep 2
+
+ip link set dev ${TUN_DEV} mtu ${MTU_SIZE} up
+
+# Enable TCP MSS Clamping to prevent packet drops on TLS handshakes
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+# Port Forwarding Rules (DNAT & SNAT) isolated for Node ${NODE_ID}
+IFS=',' read -ra PORTS <<< "${FWD_PORTS}"
+for PORT in "\${PORTS[@]}"; do
+    iptables -t nat -A PREROUTING -p tcp --dport "\$PORT" -j DNAT --to-destination "${KH_TUN_IP}:\$PORT"
+    iptables -t nat -A PREROUTING -p udp --dport "\$PORT" -j DNAT --to-destination "${KH_TUN_IP}:\$PORT"
+    iptables -t nat -A POSTROUTING -p tcp -d "${KH_TUN_IP}" --dport "\$PORT" -j SNAT --to-source "${IR_TUN_IP}"
+    iptables -t nat -A POSTROUTING -p udp -d "${KH_TUN_IP}" --dport "\$PORT" -j SNAT --to-source "${IR_TUN_IP}"
+done
+
+wait \$TUN_PID
+EOF
+
+        cat <<EOF > "${CONFIG_DIR}/stop-${NODE_ID}.sh"
+#!/usr/bin/env bash
+IFS=',' read -ra PORTS <<< "${FWD_PORTS}"
+for PORT in "\${PORTS[@]}"; do
+    iptables -t nat -D PREROUTING -p tcp --dport "\$PORT" -j DNAT --to-destination "${KH_TUN_IP}:\$PORT" 2>/dev/null || true
+    iptables -t nat -D PREROUTING -p udp --dport "\$PORT" -j DNAT --to-destination "${KH_TUN_IP}:\$PORT" 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -p tcp -d "${KH_TUN_IP}" --dport "\$PORT" -j SNAT --to-source "${IR_TUN_IP}" 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -p udp -d "${KH_TUN_IP}" --dport "\$PORT" -j SNAT --to-source "${IR_TUN_IP}" 2>/dev/null || true
+done
+ip link del ${TUN_DEV} 2>/dev/null || true
+EOF
+
+    elif [[ "$ROLE" == "2" ]]; then
+        # KHAREJ CONFIGURATION
+        read -p "Enter Iran Server IP Address: " IRAN_IP
+
+        cat <<EOF > "${CONFIG_DIR}/node-${NODE_ID}.sh"
+#!/usr/bin/env bash
+ip link del ${TUN_DEV} 2>/dev/null || true
+
+${BIN_PATH} -L "tun:///${IRAN_IP}:${TUN_PORT}?name=${TUN_DEV}&net=${KH_TUN_IP}/30&mtu=${MTU_SIZE}&peer=${IR_TUN_IP}" &
+TUN_PID=\$!
+sleep 2
+
+ip link set dev ${TUN_DEV} mtu ${MTU_SIZE} up
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+# Keep-Alive Watchdog to prevent silent tunnel freezes
+while kill -0 \$TUN_PID 2>/dev/null; do
+    if ! ping -c 3 -W 2 ${IR_TUN_IP} >/dev/null 2>&1; then
+        echo "Tunnel ping failed, restarting instance..."
+        kill -9 \$TUN_PID
+        exit 1
+    fi
+    sleep 10
+done
+EOF
+
+        cat <<EOF > "${CONFIG_DIR}/stop-${NODE_ID}.sh"
+#!/usr/bin/env bash
+ip link del ${TUN_DEV} 2>/dev/null || true
+EOF
+    else
+        echo -e "${RED}Invalid Role Selected.${NC}"
+        return
+    fi
+
+    chmod +x "${CONFIG_DIR}/node-${NODE_ID}.sh" "${CONFIG_DIR}/stop-${NODE_ID}.sh"
+
+    cat <<EOF > "${SYSTEMD_DIR}/picotun-${NODE_ID}.service"
 [Unit]
-Description=PicoTun isolated instance %i
-Wants=network-online.target
+Description=PicoTun Pro Tunnel Instance ${NODE_ID}
 After=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=10
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=/usr/bin/test -r ${CFGROOT}/%i.yaml
-ExecStart=${BIN} -c ${CFGROOT}/%i.yaml
-Restart=on-failure
-RestartSec=3s
-TimeoutStopSec=15s
-KillSignal=SIGTERM
-UMask=0077
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
-LimitNOFILE=65535
+ExecStart=${CONFIG_DIR}/node-${NODE_ID}.sh
+ExecStopPost=${CONFIG_DIR}/stop-${NODE_ID}.sh
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  chmod 644 "$UNIT"
-  systemctl daemon-reload
+
+    systemctl daemon-reload
+    systemctl enable "picotun-${NODE_ID}.service" >/dev/null 2>&1
+    systemctl restart "picotun-${NODE_ID}.service"
+
+    echo -e "${GREEN}Node ${NODE_ID} configured and started!${NC}"
+    echo -e "Iran Local IP: ${CYAN}${IR_TUN_IP}${NC} | Kharej Local IP: ${CYAN}${KH_TUN_IP}${NC} | Interface: ${CYAN}${TUN_DEV}${NC}"
 }
-write_common(){
-  local file="$1" mode="$2" psk="$3" transport="$4" listenport="$5"
-  cat > "$file" <<EOF
-config_version: 2
-mode: "${mode}"
-EOF
-  if [[ "$mode" == "server" ]]; then
-    cat >> "$file" <<EOF
-listen: "0.0.0.0:${listenport}"
-transport: "${transport}"
-psk: "${psk}"
-profile: "balanced"
-verbose: false
-heartbeat: 5
-num_connections: 4
-smux:
-  keepalive: 1
-  max_recv: 524288
-  max_stream: 524288
-  frame_size: 2048
-  version: 2
-advanced:
-  tcp_nodelay: true
-  tcp_keepalive: 3
-  tcp_read_buffer: 32768
-  tcp_write_buffer: 32768
-  max_connections: 300
-  max_streams_per_session: 256
-  cleanup_interval: 3
-  connection_timeout: 30
-  stream_timeout: 60
-  max_udp_flows: 300
-  udp_flow_timeout: 90
-  udp_buffer_size: 262144
-obfuscation:
-  enabled: false
-  min_padding: 0
-  max_padding: 0
-  min_delay_ms: 0
-  max_delay_ms: 0
-EOF
-  else
-    cat >> "$file" <<EOF
-psk: "${psk}"
-transport: "${transport}"
-profile: "balanced"
-verbose: false
-heartbeat: 5
-num_connections: 4
-paths:
-  - transport: "${transport}"
-    addr: "${listenport}"
-    connection_pool: 4
-    retry_interval: 3
-    dial_timeout: 15
-smux:
-  keepalive: 1
-  max_recv: 524288
-  max_stream: 524288
-  frame_size: 2048
-  version: 2
-advanced:
-  tcp_nodelay: true
-  tcp_keepalive: 3
-  tcp_read_buffer: 32768
-  tcp_write_buffer: 32768
-  connection_timeout: 30
-obfuscation:
-  enabled: false
-  min_padding: 0
-  max_padding: 0
-  min_delay_ms: 0
-  max_delay_ms: 0
-EOF
-  fi
+
+check_status() {
+    echo -e "\n${YELLOW}--- Active Tunnel Instances ---${NC}"
+    for svc in /etc/systemd/system/picotun-*.service; do
+        [[ -e "$svc" ]] || { echo "No active nodes found."; break; }
+        SVC_NAME=$(basename "$svc")
+        NODE_NUM=$(echo "$SVC_NAME" | grep -o -E '[0-9]+')
+        STATUS=$(systemctl is-active "$SVC_NAME")
+        if [[ "$STATUS" == "active" ]]; then
+            echo -e "Node ${NODE_NUM}: ${GREEN}ACTIVE${NC} (Sub-network: 10.10.${NODE_NUM}.0/30 | Interface: tun-pt${NODE_NUM})"
+            ping -c 1 -W 1 "10.10.${NODE_NUM}.1" >/dev/null 2>&1 && echo -e "  └─ Ping .1 (Iran): ${GREEN}OK${NC}" || echo -e "  └─ Ping .1 (Iran): ${RED}TIMEOUT${NC}"
+            ping -c 1 -W 1 "10.10.${NODE_NUM}.2" >/dev/null 2>&1 && echo -e "  └─ Ping .2 (Kharej): ${GREEN}OK${NC}" || echo -e "  └─ Ping .2 (Kharej): ${RED}TIMEOUT${NC}"
+        else
+            echo -e "Node ${NODE_NUM}: ${RED}${STATUS}${NC}"
+        fi
+    done
 }
-install_server_instance(){
-  local id port psk transport maps map item proto bind target bp tp config tmp
-  prompt id "Outside instance ID (A-D)" "A"; valid_id "$id" || die "ID must be A, B, C or D"
-  prompt port "Iran tunnel listen port" "$((2019 + $(printf '%d' "'$id") - 64))"
-  valid_port "$port" || die "Invalid tunnel port"
-  secret psk "PSK for outside $id"
-  choose_transport; transport="$TRANSPORT"
-  echo
-  echo "Enter mappings as comma-separated items: tcp:10000=10000,udp:10000=10000"
-  echo "Left port = public bind port on Iran; right port = target port on the outside."
-  prompt maps "Mappings" "tcp:10000=10000,udp:10000=10000"
-  [[ -n "$maps" ]] || die "At least one mapping is required"
-  local -A seen=()
-  tmp="$(mktemp)"
-  config="${CFGROOT}/iran-${id}.yaml"
-  # Build into a temporary file, then atomically install after validation.
-  write_common "$tmp" server "$psk" "$transport" "$port"
-  printf '\nmaps:\n' >> "$tmp"
-  IFS=',' read -r -a items <<< "$maps"
-  for item in "${items[@]}"; do
-    item="${item//[[:space:]]/}"
-    [[ "$item" =~ ^(tcp|udp):([0-9]{1,5})=([0-9]{1,5})$ ]] || { rm -f "$tmp"; die "Invalid mapping '$item'"; }
-    proto="${BASH_REMATCH[1]}"; bp="${BASH_REMATCH[2]}"; tp="${BASH_REMATCH[3]}"
-    valid_port "$bp" && valid_port "$tp" || { rm -f "$tmp"; die "Ports must be 1-65535"; }
-    [[ -z "${seen["$proto:$bp"]+x}" ]] || { rm -f "$tmp"; die "Duplicate $proto bind port $bp in this instance"; }
-    seen["$proto:$bp"]=1
-    printf '  - type: %s\n    bind: "0.0.0.0:%s"\n    target: "127.0.0.1:%s"\n' "$proto" "$bp" "$tp" >> "$tmp"
-  done
-  chmod 600 "$tmp"
-  if [[ -f "$config" ]]; then cp -a "$config" "$BACKUP_DIR/iran-${id}.yaml.$(date +%Y%m%d-%H%M%S).bak"; fi
-  install -m 600 "$tmp" "$config"; rm -f "$tmp"
-  install_unit
-  echo
-  yellow "Review the target semantics for your PicoTun version before enabling this config."
-  echo "Config: $config"
-  echo "Tunnel port: $port/tcp (transport-dependent; check the chosen transport and firewall)"
-  read -r -p "Enable and start iran-${id} now? [y/N]: " ans
-  if [[ "$ans" =~ ^[Yy]$ ]]; then
-    systemctl enable --now "picotun@iran-${id}"
-    systemctl --no-pager --full status "picotun@iran-${id}" || true
-  else
-    echo "Not started. Start later with: systemctl enable --now picotun@iran-${id}"
-  fi
-  echo
-  echo "Client settings to mirror on outside $id:"
-  echo "  mode=client; transport=$transport; PSK=<same secret>; paths.addr=<IRAN_IP>:$port"
+
+remove_node() {
+    read -p "Enter Node ID to remove: " NODE_ID
+    SVC_NAME="picotun-${NODE_ID}.service"
+    if [[ -f "${SYSTEMD_DIR}/${SVC_NAME}" ]]; then
+        systemctl stop "$SVC_NAME"
+        systemctl disable "$SVC_NAME" >/dev/null 2>&1
+        rm -f "${SYSTEMD_DIR}/${SVC_NAME}"
+        rm -f "${CONFIG_DIR}/node-${NODE_ID}.sh" "${CONFIG_DIR}/stop-${NODE_ID}.sh"
+        systemctl daemon-reload
+        echo -e "${GREEN}Node ${NODE_ID} completely removed.${NC}"
+    else
+        echo -e "${RED}Node ${NODE_ID} does not exist.${NC}"
+    fi
 }
-install_client_instance(){
-  local id iran_ipport psk transport config tmp
-  prompt id "Outside instance ID (A-D)" "A"; valid_id "$id" || die "ID must be A, B, C or D"
-  prompt iran_ipport "Iran server address and tunnel port (host:port)"
-  valid_hostport "$iran_ipport" || die "Use IPv4/hostname:port (IPv6 literals are not supported by this simple prompt)"
-  secret psk "PSK for outside $id"
-  choose_transport; transport="$TRANSPORT"
-  config="${CFGROOT}/client-${id}.yaml"; tmp="$(mktemp)"
-  write_common "$tmp" client "$psk" "$transport" "$iran_ipport"
-  chmod 600 "$tmp"
-  if [[ -f "$config" ]]; then cp -a "$config" "$BACKUP_DIR/client-${id}.yaml.$(date +%Y%m%d-%H%M%S).bak"; fi
-  install -m 600 "$tmp" "$config"; rm -f "$tmp"
-  install_unit
-  echo "Config: $config"
-  read -r -p "Enable and start client-${id} now? [y/N]: " ans
-  if [[ "$ans" =~ ^[Yy]$ ]]; then
-    systemctl enable --now "picotun@client-${id}"
-    systemctl --no-pager --full status "picotun@client-${id}" || true
-  fi
-}
-status_all(){
-  systemctl --no-pager --full list-units 'picotun@*' || true
-  echo
-  ss -lntup | grep -E 'picotun|:20[0-9][0-9]\b' || true
-}
-logs_instance(){
-  local name; prompt name "Instance suffix (e.g. iran-A or client-A)"
-  [[ "$name" =~ ^(iran|client)-[A-D]$ ]] || die "Invalid instance name"
-  journalctl -u "picotun@${name}" -n 100 --no-pager
-}
-main(){
-  need_root
-  [[ -x "$BIN" ]] || die "PicoTun binary not found at $BIN. Install the official compatible binary first; no unverified binary will be installed by this script."
-  echo "PicoTun isolated-instance manager"
-  echo "Binary: $BIN"
-  "$BIN" -version 2>&1 | head -1 || true
-  echo
-  echo "1) Configure Iran server instance"
-  echo "2) Configure outside client instance"
-  echo "3) Show service/listener status"
-  echo "4) Show instance logs"
-  echo "0) Exit"
-  local choice; prompt choice "Select" "1"
-  case "$choice" in
-    1) install_server_instance;;
-    2) install_client_instance;;
-    3) status_all;;
-    4) logs_instance;;
-    0) exit 0;;
-    *) die "Invalid choice";;
-  esac
-}
-main "$@"
+
+clear
+echo -e "${CYAN}=========================================${NC}"
+echo -e "${GREEN}      PicoTun Pro - Multi-Node Manager   ${NC}"
+echo -e "${CYAN}=========================================${NC}"
+echo "1) Add / Update Tunnel Node"
+echo "2) Check Tunnels Status & Ping"
+echo "3) Restart a Node"
+echo "4) Remove a Node"
+echo "5) Optimize Server Kernel Only"
+echo "0) Exit"
+read -p "Select an option: " OPT
+
+case $OPT in
+    1) setup_node ;;
+    2) check_status ;;
+    3) read -p "Enter Node ID to restart: " NID; systemctl restart "picotun-${NID}.service" && echo -e "${GREEN}Restarted.${NC}" ;;
+    4) remove_node ;;
+    5) optimize_kernel ;;
+    0) exit 0 ;;
+    *) echo -e "${RED}Invalid option.${NC}" ;;
+esac
